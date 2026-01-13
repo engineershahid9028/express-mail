@@ -8,7 +8,6 @@ from admin import verify_admin
 app = FastAPI(title="Express Mail API")
 
 MAILTM_BASE = "https://api.mail.tm"
-
 OTP_REGEX = r"\b\d{4,8}\b"
 
 
@@ -150,6 +149,30 @@ def admin_set_pricing(
     admin_key: str = Header(...)
 ):
     verify_admin(admin_key)
-
     r.hset(f"pricing:{country}", mapping=data)
     return {"status": "updated", "country": country}
+
+
+# ========================
+# TELEGRAM BOT ALERTS
+# ========================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+
+def send_bot_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={
+        "chat_id": CHAT_ID,
+        "text": text
+    })
+
+
+@app.post("/bot/alert")
+def bot_alert(msg: str):
+    send_bot_message(msg)
+    return {"sent": True}
