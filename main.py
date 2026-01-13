@@ -26,19 +26,16 @@ def extract_otp(text):
         r"\b[A-Z0-9]{4,8}\b",
         r"\b[A-Z]{3}-[A-Z]{3}\b"
     ]
-
     for p in patterns:
         match = re.search(p, text)
         if match:
             return match.group(0)
-
     return None
 
 
 def clean_email_body(text, html):
     if isinstance(text, list):
         text = "\n".join(text)
-
     if isinstance(html, list):
         html = "\n".join(html)
 
@@ -137,45 +134,7 @@ def create_email():
 
     r.setex(f"mailtoken:{email}", 600, token)
 
-    return {
-        "email": email,
-        "password": password
-    }
-
-
-# ========================
-# GET INBOX (API)
-# ========================
-
-@app.get("/inbox/{email}")
-def inbox(email: str):
-    token = r.get(f"mailtoken:{email}")
-    if not token:
-        raise HTTPException(404, "Session expired")
-
-    headers = {"Authorization": f"Bearer {token}"}
-    res = requests.get(f"{MAILTM_BASE}/messages", headers=headers).json()
-
-    messages = []
-    for msg in res.get("hydra:member", []):
-        msg_id = msg["id"]
-        full = requests.get(f"{MAILTM_BASE}/messages/{msg_id}", headers=headers).json()
-
-        text_part = full.get("text", "")
-        html_part = full.get("html", "")
-
-        body = clean_email_body(text_part, html_part)
-        otp = extract_otp(body)
-
-        messages.append({
-            "from": msg["from"]["address"],
-            "subject": msg["subject"],
-            "body": body,
-            "otp": otp,
-            "time": msg["createdAt"]
-        })
-
-    return {"email": email, "messages": messages}
+    return {"email": email, "password": password}
 
 
 # ========================
@@ -202,10 +161,7 @@ def watch_for_email(email, chat_id, timeout=300):
                 subject = full.get("subject", "No subject")
                 sender = full.get("from", {}).get("address", "Unknown sender")
 
-                text_part = full.get("text", "")
-                html_part = full.get("html", "")
-
-                body = clean_email_body(text_part, html_part)
+                body = clean_email_body(full.get("text", ""), full.get("html", ""))
                 otp = extract_otp(body)
 
                 message = (
@@ -220,7 +176,6 @@ def watch_for_email(email, chat_id, timeout=300):
 
                 msg_id = send_bot_message_to(chat_id, message)
 
-                # Auto delete message after 60 seconds
                 if msg_id:
                     threading.Thread(
                         target=delete_bot_message,
@@ -230,6 +185,7 @@ def watch_for_email(email, chat_id, timeout=300):
 
                 # Destroy inbox
                 r.delete(f"mailtoken:{email}")
+                r.delete(f"user_session:{chat_id}")
                 send_bot_message_to(chat_id, "🗑 Inbox destroyed for privacy.")
                 return
 
@@ -239,6 +195,7 @@ def watch_for_email(email, chat_id, timeout=300):
         time.sleep(3)
 
     r.delete(f"mailtoken:{email}")
+    r.delete(f"user_session:{chat_id}")
     send_bot_message_to(chat_id, "⌛ No email received (5 minutes). Inbox destroyed.")
 
 
@@ -256,11 +213,17 @@ def telegram_webhook(update: dict):
         if not text or not chat_id:
             return {"ok": True}
 
+        # ------------------
+        # STATUS
+        # ------------------
         if text == "/status":
             msg_id = send_bot_message_to(chat_id, "✅ Express Mail backend is running.")
             if msg_id:
                 threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 20), daemon=True).start()
 
+        # ------------------
+        # NEW EMAIL
+        # ------------------
         elif text == "/newemail":
             domains = get_domains()["domains"]
             if not domains:
@@ -289,6 +252,7 @@ def telegram_webhook(update: dict):
                         send_bot_message_to(chat_id, "❌ Login failed.")
                     else:
                         r.setex(f"mailtoken:{email}", 600, token)
+                        r.setex(f"user_session:{chat_id}", 600, email)
 
                         reply = (
                             f"📧 Your temporary email:\n\n{email}\n\n"
@@ -305,10 +269,42 @@ def telegram_webhook(update: dict):
                             daemon=True
                         ).start()
 
+        # ------------------
+        # EXTEND
+        # ------------------
+        elif text == "/extend":
+            email = r.get(f"user_session:{chat_id}")
+            if not email:
+                send_bot_message_to(chat_id, "❌ No active inbox to extend.")
+            else:
+                r.expire(f"mailtoken:{email}", 600)
+                r.expire(f"user_session:{chat_id}", 600)
+                send_bot_message_to(chat_id, "⏳ Inbox extended for 5 more minutes.")
+
+        # ------------------
+        # BURN
+        # ------------------
+        elif text == "/burn":
+            email = r.get(f"user_session:{chat_id}")
+            if not email:
+                send_bot_message_to(chat_id, "❌ No active inbox to destroy.")
+            else:
+                r.delete(f"mailtoken:{email}")
+                r.delete(f"user_session:{chat_id}")
+                send_bot_message_to(chat_id, "🔥 Inbox destroyed instantly. Session wiped.")
+
+        # ------------------
+        # HELP
+        # ------------------
         elif text == "/help":
             msg_id = send_bot_message_to(
                 chat_id,
-                "📌 Express Mail Commands:\n\n/newemail - Create email & wait\n/status - Server status\n/help - Commands"
+                "📌 Express Mail Commands:\n\n"
+                "/newemail - Create temp inbox\n"
+                "/extend - Extend inbox time\n"
+                "/burn - Destroy inbox\n"
+                "/status - Server status\n"
+                "/help - Commands"
             )
             if msg_id:
                 threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 30), daemon=True).start()
