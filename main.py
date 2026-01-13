@@ -6,11 +6,11 @@ from redis_client import r
 from geo import detect_country
 from pricing import get_country_pricing
 from admin import verify_admin
+from bs4 import BeautifulSoup
 
 app = FastAPI(title="Express Mail API")
 
 MAILTM_BASE = "https://api.mail.tm"
-OTP_REGEX = r"\b\d{4,8}\b"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -21,8 +21,43 @@ CHAT_ID = os.getenv("CHAT_ID")
 # ========================
 
 def extract_otp(text):
-    match = re.search(OTP_REGEX, text)
-    return match.group(0) if match else None
+    patterns = [
+        r"\b\d{4,8}\b",
+        r"\b[A-Z0-9]{4,8}\b",
+        r"\b[A-Z]{3}-[A-Z]{3}\b"
+    ]
+
+    for p in patterns:
+        match = re.search(p, text)
+        if match:
+            return match.group(0)
+
+    return None
+
+
+def clean_email_body(text, html):
+    # Normalize
+    if isinstance(text, list):
+        text = "\n".join(text)
+
+    if isinstance(html, list):
+        html = "\n".join(html)
+
+    # Prefer plain text if available
+    if text and len(text.strip()) > 20:
+        body = text
+    else:
+        soup = BeautifulSoup(html, "html.parser")
+        body = soup.get_text(separator="\n")
+
+    # Cleanup lines
+    lines = []
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.lower().startswith("http"):
+            lines.append(line)
+
+    return "\n".join(lines[:40])
 
 
 def send_bot_message_to(chat_id, text):
@@ -88,7 +123,7 @@ def create_email():
     if not token:
         raise HTTPException(500, "Failed to login email")
 
-    r.setex(f"mailtoken:{email}", 360, token)
+    r.setex(f"mailtoken:{email}", 600, token)
 
     return {
         "email": email,
@@ -113,12 +148,17 @@ def inbox(email: str):
     for msg in res.get("hydra:member", []):
         msg_id = msg["id"]
         full = requests.get(f"{MAILTM_BASE}/messages/{msg_id}", headers=headers).json()
-        body = full.get("text", "") + full.get("html", "")
+
+        text_part = full.get("text", "")
+        html_part = full.get("html", "")
+
+        body = clean_email_body(text_part, html_part)
         otp = extract_otp(body)
 
         messages.append({
             "from": msg["from"]["address"],
             "subject": msg["subject"],
+            "body": body,
             "otp": otp,
             "time": msg["createdAt"]
         })
@@ -129,6 +169,7 @@ def inbox(email: str):
 # ========================
 # EMAIL WATCHER (BOT)
 # ========================
+
 def watch_for_email(email, chat_id, timeout=300):
     token = r.get(f"mailtoken:{email}")
     if not token:
@@ -152,22 +193,14 @@ def watch_for_email(email, chat_id, timeout=300):
                 text_part = full.get("text", "")
                 html_part = full.get("html", "")
 
-                # Normalize body parts
-                if isinstance(text_part, list):
-                    text_part = "\n".join(text_part)
-
-                if isinstance(html_part, list):
-                    html_part = "\n".join(html_part)
-
-                body = f"{text_part}\n{html_part}".strip()
-
+                body = clean_email_body(text_part, html_part)
                 otp = extract_otp(body)
 
                 message = (
                     "📩 New Email Received\n\n"
                     f"From: {sender}\n"
                     f"Subject: {subject}\n\n"
-                    f"Message:\n{body[:3500]}\n\n"
+                    f"Message:\n{body}\n\n"
                 )
 
                 if otp:
@@ -285,7 +318,7 @@ def telegram_webhook(update: dict):
                     if not token:
                         reply = "❌ Login failed."
                     else:
-                        r.setex(f"mailtoken:{email}", 360, token)
+                        r.setex(f"mailtoken:{email}", 600, token)
 
                         reply = (
                             f"📧 Your temporary email:\n\n{email}\n\n"
@@ -328,4 +361,3 @@ def setup_telegram_webhook():
 
     res = requests.get(url).json()
     return res
-
