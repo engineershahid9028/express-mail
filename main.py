@@ -1,11 +1,9 @@
 import threading
 import time
+import requests, os, re, json, hmac, hashlib
+from datetime import datetime
 from fastapi import FastAPI, Request, Header, HTTPException
-import requests, os, re
 from redis_client import r
-from geo import detect_country
-from pricing import get_country_pricing
-from admin import verify_admin
 from bs4 import BeautifulSoup
 
 app = FastAPI(title="Express Mail API")
@@ -13,12 +11,48 @@ app = FastAPI(title="Express Mail API")
 MAILTM_BASE = "https://api.mail.tm"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
+ADMIN_IDS = [
+    7575476523  # <-- your Telegram ID
+]
 
 # ========================
-# UTILITIES
+# HELPERS
 # ========================
+
+def today():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def is_admin(chat_id):
+    return int(chat_id) in ADMIN_IDS
+
+def is_premium(chat_id):
+    return r.exists(f"premium_user:{chat_id}")
+
+def make_premium(user_id):
+    r.set(f"premium_user:{user_id}", "1")
+
+def remove_premium(user_id):
+    r.delete(f"premium_user:{user_id}")
+
+def can_create_email(chat_id):
+    if is_premium(chat_id):
+        return True, None
+
+    key = f"free_count:{chat_id}:{today()}"
+    count = int(r.get(key) or 0)
+
+    if count >= 5:
+        return False, "❌ Daily free limit reached (5 emails). Upgrade to Premium."
+
+    return True, None
+
+def increment_free_count(chat_id):
+    key = f"free_count:{chat_id}:{today()}"
+    r.incr(key)
+    r.expire(key, 86400)
+
 
 def extract_otp(text):
     patterns = [
@@ -81,7 +115,7 @@ def delete_bot_message(chat_id, message_id, delay=60):
 
 
 # ========================
-# HEALTH CHECK
+# HEALTH
 # ========================
 
 @app.get("/health")
@@ -101,44 +135,7 @@ def get_domains():
 
 
 # ========================
-# CREATE TEMP EMAIL (API)
-# ========================
-
-@app.post("/create-email")
-def create_email():
-    domains = get_domains()["domains"]
-    if not domains:
-        raise HTTPException(500, "No domains available")
-
-    import random, string
-    username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    email = f"{username}@{domains[0]}"
-    password = "TempPass123!"
-
-    acc = requests.post(f"{MAILTM_BASE}/accounts", json={
-        "address": email,
-        "password": password
-    })
-
-    if acc.status_code not in (200, 201):
-        raise HTTPException(500, "Failed to create email")
-
-    token_res = requests.post(f"{MAILTM_BASE}/token", json={
-        "address": email,
-        "password": password
-    }).json()
-
-    token = token_res.get("token")
-    if not token:
-        raise HTTPException(500, "Failed to login email")
-
-    r.setex(f"mailtoken:{email}", 600, token)
-
-    return {"email": email, "password": password}
-
-
-# ========================
-# EMAIL WATCHER (BOT)
+# EMAIL WATCHER
 # ========================
 
 def watch_for_email(email, chat_id, timeout=300):
@@ -158,17 +155,14 @@ def watch_for_email(email, chat_id, timeout=300):
                 msg_id = msgs[0]["id"]
                 full = requests.get(f"{MAILTM_BASE}/messages/{msg_id}", headers=headers).json()
 
-                subject = full.get("subject", "No subject")
-                sender = full.get("from", {}).get("address", "Unknown sender")
-
                 body = clean_email_body(full.get("text", ""), full.get("html", ""))
                 otp = extract_otp(body)
 
                 message = (
                     "📩 New Email Received\n\n"
-                    f"From: {sender}\n"
-                    f"Subject: {subject}\n\n"
-                    f"Message:\n{body}\n\n"
+                    f"From: {full.get('from', {}).get('address')}\n"
+                    f"Subject: {full.get('subject')}\n\n"
+                    f"{body}\n\n"
                 )
 
                 if otp:
@@ -183,10 +177,12 @@ def watch_for_email(email, chat_id, timeout=300):
                         daemon=True
                     ).start()
 
-                # Destroy inbox
-                r.delete(f"mailtoken:{email}")
-                r.delete(f"user_session:{chat_id}")
-                send_bot_message_to(chat_id, "🗑 Inbox destroyed for privacy.")
+                # Burn inbox (free users)
+                if not is_premium(chat_id):
+                    r.delete(f"mailtoken:{email}")
+                    r.delete(f"user_session:{chat_id}")
+                    send_bot_message_to(chat_id, "🗑 Inbox destroyed for privacy.")
+
                 return
 
         except Exception as e:
@@ -194,137 +190,180 @@ def watch_for_email(email, chat_id, timeout=300):
 
         time.sleep(3)
 
-    r.delete(f"mailtoken:{email}")
-    r.delete(f"user_session:{chat_id}")
-    send_bot_message_to(chat_id, "⌛ No email received (5 minutes). Inbox destroyed.")
-
 
 # ========================
-# TELEGRAM BOT COMMANDS
+# TELEGRAM BOT
 # ========================
 
 @app.post("/telegram/webhook")
 def telegram_webhook(update: dict):
-    try:
-        message = update.get("message", {})
-        text = message.get("text", "").strip()
-        chat_id = message.get("chat", {}).get("id")
+    message = update.get("message", {})
+    text = message.get("text", "").strip()
+    chat_id = message.get("chat", {}).get("id")
 
-        if not text or not chat_id:
-            return {"ok": True}
-
-        # ------------------
-        # STATUS
-        # ------------------
-        if text == "/status":
-            msg_id = send_bot_message_to(chat_id, "✅ Express Mail backend is running.")
-            if msg_id:
-                threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 20), daemon=True).start()
-
-        # ------------------
-        # NEW EMAIL
-        # ------------------
-        elif text == "/newemail":
-            domains = get_domains()["domains"]
-            if not domains:
-                send_bot_message_to(chat_id, "❌ No email domains available.")
-            else:
-                import random, string
-                username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-                email = f"{username}@{domains[0]}"
-                password = "TempPass123!"
-
-                acc = requests.post(f"{MAILTM_BASE}/accounts", json={
-                    "address": email,
-                    "password": password
-                })
-
-                if acc.status_code not in (200, 201):
-                    send_bot_message_to(chat_id, "❌ Failed to create email.")
-                else:
-                    token_res = requests.post(f"{MAILTM_BASE}/token", json={
-                        "address": email,
-                        "password": password
-                    }).json()
-
-                    token = token_res.get("token")
-                    if not token:
-                        send_bot_message_to(chat_id, "❌ Login failed.")
-                    else:
-                        r.setex(f"mailtoken:{email}", 600, token)
-                        r.setex(f"user_session:{chat_id}", 600, email)
-
-                        reply = (
-                            f"📧 Your temporary email:\n\n{email}\n\n"
-                            f"⏳ Waiting for email (5 minutes)..."
-                        )
-
-                        msg_id = send_bot_message_to(chat_id, reply)
-                        if msg_id:
-                            threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 30), daemon=True).start()
-
-                        threading.Thread(
-                            target=watch_for_email,
-                            args=(email, chat_id),
-                            daemon=True
-                        ).start()
-
-        # ------------------
-        # EXTEND
-        # ------------------
-        elif text == "/extend":
-            email = r.get(f"user_session:{chat_id}")
-            if not email:
-                send_bot_message_to(chat_id, "❌ No active inbox to extend.")
-            else:
-                r.expire(f"mailtoken:{email}", 600)
-                r.expire(f"user_session:{chat_id}", 600)
-                send_bot_message_to(chat_id, "⏳ Inbox extended for 5 more minutes.")
-
-        # ------------------
-        # BURN
-        # ------------------
-        elif text == "/burn":
-            email = r.get(f"user_session:{chat_id}")
-            if not email:
-                send_bot_message_to(chat_id, "❌ No active inbox to destroy.")
-            else:
-                r.delete(f"mailtoken:{email}")
-                r.delete(f"user_session:{chat_id}")
-                send_bot_message_to(chat_id, "🔥 Inbox destroyed instantly. Session wiped.")
-
-        # ------------------
-        # HELP
-        # ------------------
-        elif text == "/help":
-            msg_id = send_bot_message_to(
-                chat_id,
-                "📌 Express Mail Commands:\n\n"
-                "/newemail - Create temp inbox\n"
-                "/extend - Extend inbox time\n"
-                "/burn - Destroy inbox\n"
-                "/status - Server status\n"
-                "/help - Commands"
-            )
-            if msg_id:
-                threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 30), daemon=True).start()
-
-        else:
-            send_bot_message_to(chat_id, "❓ Unknown command. Type /help")
-
+    if not text or not chat_id:
         return {"ok": True}
 
-    except Exception as e:
-        print("Telegram webhook error:", e)
-        return {"ok": False}
+    # ====================
+    # USER COMMANDS
+    # ====================
+
+    if text == "/status":
+        send_bot_message_to(chat_id, "✅ Express Mail backend running.")
+
+    elif text == "/quota":
+        if is_premium(chat_id):
+            send_bot_message_to(chat_id, "👑 Premium user — Unlimited emails.")
+        else:
+            key = f"free_count:{chat_id}:{today()}"
+            used = int(r.get(key) or 0)
+            remaining = 5 - used
+            send_bot_message_to(chat_id, f"📊 Free quota: {remaining}/5 emails remaining today.")
+
+    elif text == "/buy":
+        send_bot_message_to(chat_id,
+            "💳 Premium Upgrade\n\n"
+            "Pay via Binance Pay (USDT)\n\n"
+            f"Use your Telegram ID as Order ID:\n{chat_id}\n\n"
+            "Premium unlocks automatically after payment."
+        )
+
+    elif text.startswith("/newemail"):
+        allowed, error = can_create_email(chat_id)
+        if not allowed:
+            send_bot_message_to(chat_id, error)
+            return {"ok": True}
+
+        domains = get_domains()["domains"]
+        if not domains:
+            send_bot_message_to(chat_id, "❌ No email domains available.")
+            return {"ok": True}
+
+        import random, string
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        email = f"{username}@{domains[0]}"
+        password = "TempPass123!"
+
+        acc = requests.post(f"{MAILTM_BASE}/accounts", json={
+            "address": email,
+            "password": password
+        })
+
+        if acc.status_code not in (200, 201):
+            send_bot_message_to(chat_id, "❌ Failed to create email.")
+            return {"ok": True}
+
+        token_res = requests.post(f"{MAILTM_BASE}/token", json={
+            "address": email,
+            "password": password
+        }).json()
+
+        token = token_res.get("token")
+        if not token:
+            send_bot_message_to(chat_id, "❌ Login failed.")
+            return {"ok": True}
+
+        r.setex(f"mailtoken:{email}", 600, token)
+        r.setex(f"user_session:{chat_id}", 600, email)
+
+        if not is_premium(chat_id):
+            increment_free_count(chat_id)
+
+        send_bot_message_to(chat_id,
+            f"📧 Temp Email:\n\n{email}\n\n⏳ Waiting for email..."
+        )
+
+        threading.Thread(target=watch_for_email, args=(email, chat_id), daemon=True).start()
+
+    # ====================
+    # PREMIUM COMMANDS
+    # ====================
+
+    elif text == "/extend":
+        if not is_premium(chat_id):
+            send_bot_message_to(chat_id, "⭐ Premium only feature.")
+            return {"ok": True}
+
+        email = r.get(f"user_session:{chat_id}")
+        if not email:
+            send_bot_message_to(chat_id, "❌ No active inbox.")
+        else:
+            r.expire(f"mailtoken:{email}", 600)
+            r.expire(f"user_session:{chat_id}", 600)
+            send_bot_message_to(chat_id, "⏳ Inbox extended 5 more minutes.")
+
+    elif text == "/burn":
+        if not is_premium(chat_id):
+            send_bot_message_to(chat_id, "⭐ Premium only feature.")
+            return {"ok": True}
+
+        email = r.get(f"user_session:{chat_id}")
+        if email:
+            r.delete(f"mailtoken:{email}")
+            r.delete(f"user_session:{chat_id}")
+            send_bot_message_to(chat_id, "🔥 Inbox destroyed.")
+
+
+    # ====================
+    # ADMIN COMMANDS
+    # ====================
+
+    elif text.startswith("/makepremium"):
+        if not is_admin(chat_id):
+            send_bot_message_to(chat_id, "❌ Admin only.")
+            return {"ok": True}
+
+        user_id = text.split()[1]
+        make_premium(user_id)
+        send_bot_message_to(chat_id, f"⭐ User {user_id} is now Premium.")
+
+    elif text.startswith("/removepremium"):
+        if not is_admin(chat_id):
+            send_bot_message_to(chat_id, "❌ Admin only.")
+            return {"ok": True}
+
+        user_id = text.split()[1]
+        remove_premium(user_id)
+        send_bot_message_to(chat_id, f"❌ Premium removed from {user_id}.")
+
+    elif text == "/premiumlist":
+        if not is_admin(chat_id):
+            send_bot_message_to(chat_id, "❌ Admin only.")
+            return {"ok": True}
+
+        users = [k.split(":")[1] for k in r.keys("premium_user:*")]
+        send_bot_message_to(chat_id, "⭐ Premium Users:\n" + "\n".join(users))
+
+    return {"ok": True}
 
 
 # ========================
-# TELEGRAM WEBHOOK SETUP
+# BINANCE PAY WEBHOOK
 # ========================
 
-@app.get("/setup-telegram-webhook")
-def setup_telegram_webhook():
-    webhook_url = "https://web-production-5e56.up.railway.app/telegram/webhook"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
-    return requests.get(url).json()
+def verify_binance_signature(payload, signature):
+    computed = hmac.new(
+        BINANCE_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    return computed == signature
+
+
+@app.post("/payment/binance/webhook")
+async def binance_webhook(request: Request, x_signature: str = Header(None)):
+    payload = await request.body()
+    payload_str = payload.decode()
+
+    if not verify_binance_signature(payload_str, x_signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    data = json.loads(payload_str)
+
+    if data.get("status") == "PAID":
+        user_id = data.get("merchantOrderId")
+        make_premium(user_id)
+        send_bot_message_to(user_id, "⭐ Payment received! You are now Premium.")
+
+    return {"status": "ok"}
