@@ -176,3 +176,45 @@ def send_bot_message(text):
 def bot_alert(msg: str):
     send_bot_message(msg)
     return {"sent": True}
+# ========================
+# TELEGRAM BOT COMMANDS
+# ========================
+
+@app.post("/telegram/webhook")
+def telegram_webhook(update: dict):
+    message = update.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id")
+
+    if not text or not chat_id:
+        return {"ok": True}
+
+    if text == "/status":
+        reply = "✅ Express Mail backend is running."
+
+    elif text == "/health":
+        reply = "🟢 System status: OK"
+
+    elif text == "/pricing":
+        pricing = get_country_pricing("PK") or {}
+        reply = f"💰 PK Pricing:\nWeek: {pricing.get('week')}\nMonth: {pricing.get('month')}"
+
+    elif text == "/help":
+        reply = (
+            "📌 Express Mail Bot Commands:\n"
+            "/status - Check server status\n"
+            "/pricing - Show PK pricing\n"
+            "/help - Show commands"
+        )
+
+    else:
+        reply = "❓ Unknown command. Type /help"
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={
+        "chat_id": chat_id,
+        "text": reply
+    })
+
+    return {"ok": True}
+
