@@ -217,4 +217,12 @@ def telegram_webhook(update: dict):
     })
 
     return {"ok": True}
+@app.get("/setup-telegram-webhook")
+def setup_telegram_webhook():
+    webhook_url = "https://web-production-5e56.up.railway.app/telegram/webhook"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
+
+    res = requests.get(url).json()
+    return res
+
 
