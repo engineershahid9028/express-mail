@@ -36,21 +36,18 @@ def extract_otp(text):
 
 
 def clean_email_body(text, html):
-    # Normalize
     if isinstance(text, list):
         text = "\n".join(text)
 
     if isinstance(html, list):
         html = "\n".join(html)
 
-    # Prefer plain text if available
     if text and len(text.strip()) > 20:
         body = text
     else:
         soup = BeautifulSoup(html, "html.parser")
         body = soup.get_text(separator="\n")
 
-    # Cleanup lines
     lines = []
     for line in body.splitlines():
         line = line.strip()
@@ -60,14 +57,29 @@ def clean_email_body(text, html):
     return "\n".join(lines[:40])
 
 
+# ========================
+# TELEGRAM HELPERS
+# ========================
+
 def send_bot_message_to(chat_id, text):
     if not BOT_TOKEN:
-        return
+        return None
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={
+    res = requests.post(url, data={
         "chat_id": chat_id,
         "text": text
+    }).json()
+
+    return res.get("result", {}).get("message_id")
+
+
+def delete_bot_message(chat_id, message_id, delay=60):
+    time.sleep(delay)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    requests.post(url, data={
+        "chat_id": chat_id,
+        "message_id": message_id
     })
 
 
@@ -206,9 +218,17 @@ def watch_for_email(email, chat_id, timeout=300):
                 if otp:
                     message += f"🔐 OTP: {otp}"
 
-                send_bot_message_to(chat_id, message)
+                msg_id = send_bot_message_to(chat_id, message)
 
-                # Destroy inbox after delivery
+                # Auto delete message after 60 seconds
+                if msg_id:
+                    threading.Thread(
+                        target=delete_bot_message,
+                        args=(chat_id, msg_id, 300),
+                        daemon=True
+                    ).start()
+
+                # Destroy inbox
                 r.delete(f"mailtoken:{email}")
                 send_bot_message_to(chat_id, "🗑 Inbox destroyed for privacy.")
                 return
@@ -218,60 +238,8 @@ def watch_for_email(email, chat_id, timeout=300):
 
         time.sleep(3)
 
-    # Timeout
     r.delete(f"mailtoken:{email}")
     send_bot_message_to(chat_id, "⌛ No email received (5 minutes). Inbox destroyed.")
-
-
-# ========================
-# AUTO COUNTRY PRICING
-# ========================
-
-@app.get("/pricing")
-def pricing(request: Request, country_override: str = None):
-    ip = request.client.host
-    country = country_override or detect_country(ip)
-
-    pricing = get_country_pricing(country)
-    if not pricing:
-        pricing = get_country_pricing("US")
-
-    return {
-        "country": country,
-        "currency": pricing.get("currency", "USD"),
-        "plans": {
-            "week": pricing.get("week"),
-            "month": pricing.get("month"),
-            "3month": pricing.get("3month"),
-            "12month": pricing.get("12month")
-        }
-    }
-
-
-# ========================
-# ADMIN: SET PRICING
-# ========================
-
-@app.post("/admin/pricing/{country}")
-def admin_set_pricing(
-    country: str,
-    data: dict,
-    admin_key: str = Header(...)
-):
-    verify_admin(admin_key)
-    r.hset(f"pricing:{country}", mapping=data)
-    return {"status": "updated", "country": country}
-
-
-# ========================
-# TELEGRAM BOT ALERTS
-# ========================
-
-@app.post("/bot/alert")
-def bot_alert(msg: str):
-    if CHAT_ID:
-        send_bot_message_to(CHAT_ID, msg)
-    return {"sent": True}
 
 
 # ========================
@@ -289,12 +257,14 @@ def telegram_webhook(update: dict):
             return {"ok": True}
 
         if text == "/status":
-            reply = "✅ Express Mail backend is running."
+            msg_id = send_bot_message_to(chat_id, "✅ Express Mail backend is running.")
+            if msg_id:
+                threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 20), daemon=True).start()
 
         elif text == "/newemail":
             domains = get_domains()["domains"]
             if not domains:
-                reply = "❌ No email domains available."
+                send_bot_message_to(chat_id, "❌ No email domains available.")
             else:
                 import random, string
                 username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
@@ -307,7 +277,7 @@ def telegram_webhook(update: dict):
                 })
 
                 if acc.status_code not in (200, 201):
-                    reply = "❌ Failed to create email."
+                    send_bot_message_to(chat_id, "❌ Failed to create email.")
                 else:
                     token_res = requests.post(f"{MAILTM_BASE}/token", json={
                         "address": email,
@@ -316,7 +286,7 @@ def telegram_webhook(update: dict):
 
                     token = token_res.get("token")
                     if not token:
-                        reply = "❌ Login failed."
+                        send_bot_message_to(chat_id, "❌ Login failed.")
                     else:
                         r.setex(f"mailtoken:{email}", 600, token)
 
@@ -325,6 +295,10 @@ def telegram_webhook(update: dict):
                             f"⏳ Waiting for email (5 minutes)..."
                         )
 
+                        msg_id = send_bot_message_to(chat_id, reply)
+                        if msg_id:
+                            threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 30), daemon=True).start()
+
                         threading.Thread(
                             target=watch_for_email,
                             args=(email, chat_id),
@@ -332,17 +306,16 @@ def telegram_webhook(update: dict):
                         ).start()
 
         elif text == "/help":
-            reply = (
-                "📌 Express Mail Bot Commands:\n\n"
-                "/newemail - Create temp email & wait for email\n"
-                "/status - Server status\n"
-                "/help - Show commands"
+            msg_id = send_bot_message_to(
+                chat_id,
+                "📌 Express Mail Commands:\n\n/newemail - Create email & wait\n/status - Server status\n/help - Commands"
             )
+            if msg_id:
+                threading.Thread(target=delete_bot_message, args=(chat_id, msg_id, 30), daemon=True).start()
 
         else:
-            reply = "❓ Unknown command. Type /help"
+            send_bot_message_to(chat_id, "❓ Unknown command. Type /help")
 
-        send_bot_message_to(chat_id, reply)
         return {"ok": True}
 
     except Exception as e:
@@ -358,6 +331,4 @@ def telegram_webhook(update: dict):
 def setup_telegram_webhook():
     webhook_url = "https://web-production-5e56.up.railway.app/telegram/webhook"
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
-
-    res = requests.get(url).json()
-    return res
+    return requests.get(url).json()
