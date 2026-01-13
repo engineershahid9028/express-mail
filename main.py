@@ -15,6 +15,7 @@ OTP_REGEX = r"\b\d{4,8}\b"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+
 # ========================
 # UTILITIES
 # ========================
@@ -87,7 +88,7 @@ def create_email():
     if not token:
         raise HTTPException(500, "Failed to login email")
 
-    r.setex(f"mailtoken:{email}", 3600, token)
+    r.setex(f"mailtoken:{email}", 360, token)
 
     return {
         "email": email,
@@ -126,10 +127,10 @@ def inbox(email: str):
 
 
 # ========================
-# OTP WATCHER (BOT)
+# EMAIL WATCHER (BOT)
 # ========================
 
-def watch_for_otp(email, chat_id, timeout=120):
+def watch_for_email(email, chat_id, timeout=300):
     token = r.get(f"mailtoken:{email}")
     if not token:
         return
@@ -145,24 +146,38 @@ def watch_for_otp(email, chat_id, timeout=120):
             if msgs:
                 msg_id = msgs[0]["id"]
                 full = requests.get(f"{MAILTM_BASE}/messages/{msg_id}", headers=headers).json()
-                body = full.get("text", "") + full.get("html", "")
+
+                subject = full.get("subject", "No subject")
+                sender = full.get("from", {}).get("address", "Unknown sender")
+                body = (full.get("text", "") + "\n" + full.get("html", "")).strip()
+
                 otp = extract_otp(body)
 
+                message = (
+                    "📩 New Email Received\n\n"
+                    f"From: {sender}\n"
+                    f"Subject: {subject}\n\n"
+                    f"Message:\n{body[:3500]}\n\n"
+                )
+
                 if otp:
-                    send_bot_message_to(chat_id, f"🔐 OTP Received:\n\n{otp}")
+                    message += f"🔐 OTP: {otp}"
 
-                    # Destroy email session
-                    r.delete(f"mailtoken:{email}")
-                    send_bot_message_to(chat_id, "🗑 Email session destroyed for privacy.")
-                    return
-        except:
-            pass
+                send_bot_message_to(chat_id, message)
 
-        time.sleep(5)
+                # Destroy inbox after delivery
+                r.delete(f"mailtoken:{email}")
+                send_bot_message_to(chat_id, "🗑 Inbox destroyed for privacy.")
+                return
 
-    # Timeout reached
+        except Exception as e:
+            print("Watcher error:", e)
+
+        time.sleep(3)
+
+    # Timeout
     r.delete(f"mailtoken:{email}")
-    send_bot_message_to(chat_id, "⌛ OTP timeout. Email destroyed.")
+    send_bot_message_to(chat_id, "⌛ No email received (5 minutes). Inbox destroyed.")
 
 
 # ========================
@@ -230,10 +245,6 @@ def telegram_webhook(update: dict):
         if not text or not chat_id:
             return {"ok": True}
 
-        # ======================
-        # COMMANDS
-        # ======================
-
         if text == "/status":
             reply = "✅ Express Mail backend is running."
 
@@ -264,17 +275,15 @@ def telegram_webhook(update: dict):
                     if not token:
                         reply = "❌ Login failed."
                     else:
-                        # Save token for 3 minutes only
-                        r.setex(f"mailtoken:{email}", 180, token)
+                        r.setex(f"mailtoken:{email}", 360, token)
 
                         reply = (
                             f"📧 Your temporary email:\n\n{email}\n\n"
-                            f"⏳ Waiting for OTP (2 minutes)..."
+                            f"⏳ Waiting for email (5 minutes)..."
                         )
 
-                        # Start OTP watcher
                         threading.Thread(
-                            target=watch_for_otp,
+                            target=watch_for_email,
                             args=(email, chat_id),
                             daemon=True
                         ).start()
@@ -282,7 +291,7 @@ def telegram_webhook(update: dict):
         elif text == "/help":
             reply = (
                 "📌 Express Mail Bot Commands:\n\n"
-                "/newemail - Create temp email & wait for OTP\n"
+                "/newemail - Create temp email & wait for email\n"
                 "/status - Server status\n"
                 "/help - Show commands"
             )
