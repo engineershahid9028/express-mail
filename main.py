@@ -129,7 +129,6 @@ def inbox(email: str):
 # ========================
 # EMAIL WATCHER (BOT)
 # ========================
-
 def watch_for_email(email, chat_id, timeout=300):
     token = r.get(f"mailtoken:{email}")
     if not token:
@@ -149,7 +148,18 @@ def watch_for_email(email, chat_id, timeout=300):
 
                 subject = full.get("subject", "No subject")
                 sender = full.get("from", {}).get("address", "Unknown sender")
-                body = (full.get("text", "") + "\n" + full.get("html", "")).strip()
+
+                text_part = full.get("text", "")
+                html_part = full.get("html", "")
+
+                # Normalize body parts
+                if isinstance(text_part, list):
+                    text_part = "\n".join(text_part)
+
+                if isinstance(html_part, list):
+                    html_part = "\n".join(html_part)
+
+                body = f"{text_part}\n{html_part}".strip()
 
                 otp = extract_otp(body)
 
@@ -318,3 +328,4 @@ def setup_telegram_webhook():
 
     res = requests.get(url).json()
     return res
+
