@@ -1,3 +1,5 @@
+import threading
+import time
 from fastapi import FastAPI, Request, Header, HTTPException
 import requests, os, re
 from redis_client import r
@@ -10,6 +12,8 @@ app = FastAPI(title="Express Mail API")
 MAILTM_BASE = "https://api.mail.tm"
 OTP_REGEX = r"\b\d{4,8}\b"
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # ========================
 # UTILITIES
@@ -18,6 +22,17 @@ OTP_REGEX = r"\b\d{4,8}\b"
 def extract_otp(text):
     match = re.search(OTP_REGEX, text)
     return match.group(0) if match else None
+
+
+def send_bot_message_to(chat_id, text):
+    if not BOT_TOKEN:
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={
+        "chat_id": chat_id,
+        "text": text
+    })
 
 
 # ========================
@@ -41,7 +56,7 @@ def get_domains():
 
 
 # ========================
-# CREATE TEMP EMAIL
+# CREATE TEMP EMAIL (API)
 # ========================
 
 @app.post("/create-email")
@@ -55,7 +70,6 @@ def create_email():
     email = f"{username}@{domains[0]}"
     password = "TempPass123!"
 
-    # Create account
     acc = requests.post(f"{MAILTM_BASE}/accounts", json={
         "address": email,
         "password": password
@@ -64,7 +78,6 @@ def create_email():
     if acc.status_code not in (200, 201):
         raise HTTPException(500, "Failed to create email")
 
-    # Login
     token_res = requests.post(f"{MAILTM_BASE}/token", json={
         "address": email,
         "password": password
@@ -74,7 +87,6 @@ def create_email():
     if not token:
         raise HTTPException(500, "Failed to login email")
 
-    # Save token temporarily
     r.setex(f"mailtoken:{email}", 3600, token)
 
     return {
@@ -84,7 +96,7 @@ def create_email():
 
 
 # ========================
-# GET INBOX
+# GET INBOX (API)
 # ========================
 
 @app.get("/inbox/{email}")
@@ -111,6 +123,46 @@ def inbox(email: str):
         })
 
     return {"email": email, "messages": messages}
+
+
+# ========================
+# OTP WATCHER (BOT)
+# ========================
+
+def watch_for_otp(email, chat_id, timeout=120):
+    token = r.get(f"mailtoken:{email}")
+    if not token:
+        return
+
+    headers = {"Authorization": f"Bearer {token}"}
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        try:
+            res = requests.get(f"{MAILTM_BASE}/messages", headers=headers).json()
+            msgs = res.get("hydra:member", [])
+
+            if msgs:
+                msg_id = msgs[0]["id"]
+                full = requests.get(f"{MAILTM_BASE}/messages/{msg_id}", headers=headers).json()
+                body = full.get("text", "") + full.get("html", "")
+                otp = extract_otp(body)
+
+                if otp:
+                    send_bot_message_to(chat_id, f"🔐 OTP Received:\n\n{otp}")
+
+                    # Destroy email session
+                    r.delete(f"mailtoken:{email}")
+                    send_bot_message_to(chat_id, "🗑 Email session destroyed for privacy.")
+                    return
+        except:
+            pass
+
+        time.sleep(5)
+
+    # Timeout reached
+    r.delete(f"mailtoken:{email}")
+    send_bot_message_to(chat_id, "⌛ OTP timeout. Email destroyed.")
 
 
 # ========================
@@ -157,66 +209,99 @@ def admin_set_pricing(
 # TELEGRAM BOT ALERTS
 # ========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
-
-def send_bot_message(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={
-        "chat_id": CHAT_ID,
-        "text": text
-    })
-
-
 @app.post("/bot/alert")
 def bot_alert(msg: str):
-    send_bot_message(msg)
+    if CHAT_ID:
+        send_bot_message_to(CHAT_ID, msg)
     return {"sent": True}
+
+
 # ========================
 # TELEGRAM BOT COMMANDS
 # ========================
 
 @app.post("/telegram/webhook")
 def telegram_webhook(update: dict):
-    message = update.get("message", {})
-    text = message.get("text", "")
-    chat_id = message.get("chat", {}).get("id")
+    try:
+        message = update.get("message", {})
+        text = message.get("text", "").strip()
+        chat_id = message.get("chat", {}).get("id")
 
-    if not text or not chat_id:
+        if not text or not chat_id:
+            return {"ok": True}
+
+        # ======================
+        # COMMANDS
+        # ======================
+
+        if text == "/status":
+            reply = "✅ Express Mail backend is running."
+
+        elif text == "/newemail":
+            domains = get_domains()["domains"]
+            if not domains:
+                reply = "❌ No email domains available."
+            else:
+                import random, string
+                username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                email = f"{username}@{domains[0]}"
+                password = "TempPass123!"
+
+                acc = requests.post(f"{MAILTM_BASE}/accounts", json={
+                    "address": email,
+                    "password": password
+                })
+
+                if acc.status_code not in (200, 201):
+                    reply = "❌ Failed to create email."
+                else:
+                    token_res = requests.post(f"{MAILTM_BASE}/token", json={
+                        "address": email,
+                        "password": password
+                    }).json()
+
+                    token = token_res.get("token")
+                    if not token:
+                        reply = "❌ Login failed."
+                    else:
+                        # Save token for 3 minutes only
+                        r.setex(f"mailtoken:{email}", 180, token)
+
+                        reply = (
+                            f"📧 Your temporary email:\n\n{email}\n\n"
+                            f"⏳ Waiting for OTP (2 minutes)..."
+                        )
+
+                        # Start OTP watcher
+                        threading.Thread(
+                            target=watch_for_otp,
+                            args=(email, chat_id),
+                            daemon=True
+                        ).start()
+
+        elif text == "/help":
+            reply = (
+                "📌 Express Mail Bot Commands:\n\n"
+                "/newemail - Create temp email & wait for OTP\n"
+                "/status - Server status\n"
+                "/help - Show commands"
+            )
+
+        else:
+            reply = "❓ Unknown command. Type /help"
+
+        send_bot_message_to(chat_id, reply)
         return {"ok": True}
 
-    if text == "/status":
-        reply = "✅ Express Mail backend is running."
+    except Exception as e:
+        print("Telegram webhook error:", e)
+        return {"ok": False}
 
-    elif text == "/health":
-        reply = "🟢 System status: OK"
 
-    elif text == "/pricing":
-        pricing = get_country_pricing("PK") or {}
-        reply = f"💰 PK Pricing:\nWeek: {pricing.get('week')}\nMonth: {pricing.get('month')}"
+# ========================
+# TELEGRAM WEBHOOK SETUP
+# ========================
 
-    elif text == "/help":
-        reply = (
-            "📌 Express Mail Bot Commands:\n"
-            "/status - Check server status\n"
-            "/pricing - Show PK pricing\n"
-            "/help - Show commands"
-        )
-
-    else:
-        reply = "❓ Unknown command. Type /help"
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={
-        "chat_id": chat_id,
-        "text": reply
-    })
-
-    return {"ok": True}
 @app.get("/setup-telegram-webhook")
 def setup_telegram_webhook():
     webhook_url = "https://web-production-5e56.up.railway.app/telegram/webhook"
@@ -224,5 +309,3 @@ def setup_telegram_webhook():
 
     res = requests.get(url).json()
     return res
-
-
