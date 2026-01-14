@@ -1,7 +1,7 @@
 from fastapi import APIRouter
-from ui import show_main_menu
-from limits import can_create_email, increment_free_count, is_premium
-from redis_client import r
+from backend.ui import show_main_menu
+from backend.limits import can_create_email, increment_free_count, is_premium
+from backend.redis_client import r
 
 bot_router = APIRouter()
 
