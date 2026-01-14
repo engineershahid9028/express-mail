@@ -1,6 +1,6 @@
 from fastapi import FastAPI
-from bot import bot_router
-from payments import payment_router
+from backend.bot import bot_router
+from backend.payments import payment_router
 
 app = FastAPI(title="Express Mail Platform")
 
