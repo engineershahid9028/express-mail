@@ -1,6 +1,6 @@
 from datetime import datetime
-from redis_client import r
-from config import FREE_DAILY_LIMIT
+from backend.redis_client import r
+from backend.config import FREE_DAILY_LIMIT
 
 def today():
     return datetime.utcnow().strftime("%Y-%m-%d")
