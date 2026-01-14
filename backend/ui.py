@@ -1,5 +1,5 @@
 import json, requests
-from config import BOT_TOKEN
+from backend.config import BOT_TOKEN
 
 def send_ui(chat_id, text, buttons):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
