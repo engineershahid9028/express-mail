@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Header, HTTPException
-import os, hmac, hashlib, json
-from redis_client import r
-from config import BINANCE_SECRET
+import hmac, hashlib, json
+from backend.redis_client import r
+from backend.config import BINANCE_SECRET
 
 payment_router = APIRouter()
 
